@@ -112,6 +112,12 @@ module OpenAISwarm
     end
 
     def self.function_to_json(func_instance)
+      # is this a built in OpenAI Tool?
+      if func_instance.is_a?(Hash) && (func_instance[:type] == "web_search_preview" || func_instance[:type] == "file_search")
+        Util.debug_print(true, "Found a built in OpenAI Tool: #{func_instance.inspect}")
+        return func_instance
+      end
+
       is_target_method = func_instance.respond_to?(:target_method) || func_instance.is_a?(OpenAISwarm::FunctionDescriptor)
       func = is_target_method ? func_instance.target_method : func_instance
       custom_parameters = is_target_method ? func_instance.parameters : nil
@@ -153,11 +159,9 @@ module OpenAISwarm
 
       {
         type: "function",
-        function: {
-          name: function_name,
-          description: description || '',
-          parameters: custom_parameters || json_parameters
-        }
+        name: function_name,
+        description: description || '',
+        parameters: custom_parameters || json_parameters
       }
     end
   end

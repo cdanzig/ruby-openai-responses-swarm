@@ -42,17 +42,20 @@ module OpenAISwarm
 
       tools = agent.functions.map { |f| Util.function_to_json(f) }
       # hide context_variables from model
+
       tools.each do |tool|
-        params = tool[:function][:parameters]
-        params[:properties].delete(CTX_VARS_NAME.to_sym)
-        params[:required]&.delete(CTX_VARS_NAME.to_sym)
+        if tool[:parameters]
+          params = tool[:parameters]
+          params[:properties].delete(CTX_VARS_NAME.to_sym)
+          params[:required]&.delete(CTX_VARS_NAME.to_sym)
+        end
       end
 
       cleaned_messages = Util.clean_message_tools(messages, agent.noisy_tool_calls)
 
       create_params = {
         model: model_override || agent.model,
-        messages: cleaned_messages,
+        input: cleaned_messages,
         tools: Util.request_tools_excluded(tools, agent_tracker.tracking_agents_tool_name, agent.strategy.prevent_agent_reentry),
       }
 
@@ -75,19 +78,21 @@ module OpenAISwarm
       Util.debug_print(debug, "Getting chat completion for...:", create_params)
       log_message(:info, "Getting chat completion for...:", create_params)
 
-      if stream
-        return Enumerator.new do |yielder|
-          yielder << { 'parameters' => create_params }
-
-          @client.chat(parameters: create_params.merge(
-            stream: proc do |chunk, _bytesize|
-              yielder << { chunk: chunk }
-            end
-          ))
-        end
-      else
-        response = @client.chat(parameters: create_params)
-      end
+      # if stream
+      #   return Enumerator.new do |yielder|
+      #     yielder << { 'parameters' => create_params }
+      #     @client.responses(parameters: create_params.merge(
+      #       stream: proc do |chunk, _bytesize|
+      #         yielder << { chunk: chunk }
+      #       end
+      #     ))
+      #   end
+      # else
+        # Need to remove the sender for the responses API
+        create_params[:input] = create_params[:input].map{|m| m.reject{|k,v| k == "sender"}}
+        Rails.logger.info("Calling response.create with parameters: #{create_params.inspect}")
+        response = @client.responses.create(parameters: create_params)
+      # end
 
       Util.debug_print(debug, "API Response:", response)
       response
@@ -104,7 +109,7 @@ module OpenAISwarm
         result
       when Agent
         Result.new(
-          value: JSON.generate({ assistant: result.name }),
+          value: "success", #JSON.generate({ assistant: result.name }),
           agent: result
         )
       else
@@ -122,12 +127,14 @@ module OpenAISwarm
       functions = active_agent.functions
 
       function_map = functions.map do |f|
-        if f.is_a?(OpenAISwarm::FunctionDescriptor)
+        if f.is_a?(Hash) and (f[:type] == "web_search_preview" or f[:type] == "file_search")
+          nil
+        elsif f.is_a?(OpenAISwarm::FunctionDescriptor)
           [f.target_method.name, f.target_method]
         else
           [f.name, f]
         end
-      end.to_h.transform_keys(&:to_s)
+      end.compact.to_h.transform_keys(&:to_s)
 
       partial_response = Response.new(
         messages: [],
@@ -136,20 +143,19 @@ module OpenAISwarm
       )
 
       tool_calls.each do |tool_call|
-        name = tool_call.dig('function', 'name')
+        name = tool_call.dig('name')
         unless function_map.key?(name)
           Util.debug_print(debug, "Tool #{name} not found in function map.")
           log_message(:error, "Tool #{name} not found in function map.")
           partial_response.messages << {
-            'role' => 'tool',
-            'tool_call_id' => tool_call['id'],
-            'tool_name' => name,
-            'content' => "Error: Tool #{name} not found."
+            'type' => 'function_call_output',
+            'call_id' => tool_call['call_id'],
+            'output' => "Error: Tool #{name} not found."
           }
           next
         end
 
-        args = JSON.parse(tool_call.dig('function', 'arguments') || '{}')
+        args = JSON.parse(tool_call.dig('arguments') || '{}')
         Util.debug_print(debug, "Processing tool call: #{name} with arguments #{args}")
         log_message(:info, "Processing tool call: #{name} with arguments #{args}")
 
@@ -163,10 +169,9 @@ module OpenAISwarm
         result = handle_function_result(raw_result, debug)
 
         partial_response.messages << {
-          'role' => 'tool',
-          'tool_call_id' => tool_call['id'],
-          'tool_name' => name,
-          'content' => result.value
+          'type' => 'function_call_output',
+          'call_id' => tool_call['call_id'],
+          'output' => result.value
         }
 
         partial_response.context_variables.merge!(result.context_variables)
@@ -197,6 +202,7 @@ module OpenAISwarm
       init_len = messages.length
 
       while history.length - init_len < max_turns && active_agent
+
         agent_tracker.update(active_agent)
         history = OpenAISwarm::Util.latest_role_user_message(history) if agent_tracker.switch_agent_reset_message?
 
@@ -210,122 +216,21 @@ module OpenAISwarm
           metadata
         )
 
-        message = completion.dig('choices', 0, 'message') || {}
-        Util.debug_print(debug, "Received completion:", message)
-        log_message(:info, "Received completion:", message)
+        # add to the messages array
+        Util.debug_print(debug, "Whole Completion: #{completion.inspect}")
+        messages = []
+        completion['output'].each do |output|
+          output['sender'] = active_agent&.name
+          Util.debug_print(debug, "Found a #{output['type']} output: #{output.inspect}")
+        end
+        history += completion['output']
 
-        message['sender'] = active_agent&.name
-        history << message
+        tool_calls = completion['output'].select { |output| output['type'] == 'function_call' }
 
-        if !message['tool_calls'] || !execute_tools
+        if tool_calls.empty? || !execute_tools
+          Util.debug_print(debug, "Ending turn.")
           log_message(:info, "Ending turn.")
           break
-        end
-
-        partial_response = handle_tool_calls(
-          message['tool_calls'],
-          active_agent,
-          context_variables,
-          debug
-        )
-
-        if partial_response.agent
-          agent_tool_name = message['tool_calls'].dig(0, 'function', 'name')
-          agent_tracker.add_tracking_agents_tool_name(agent_tool_name)
-        end
-
-        history.concat(partial_response.messages)
-        context_variables.merge!(partial_response.context_variables)
-        active_agent = partial_response.agent if partial_response.agent
-      end
-
-      Response.new(
-        messages: history[init_len..],
-        agent: active_agent,
-        context_variables: context_variables
-      )
-    end
-
-    # TODO(Grayson): a lot of copied code here that will be refactored
-    def run_and_stream(agent:, messages:, context_variables: {}, model_override: nil, debug: false, max_turns: Float::INFINITY, execute_tools: true, metadata: nil)
-      agent_tracker = OpenAISwarm::Agents::ChangeTracker.new(agent)
-      active_agent = agent
-      context_variables = context_variables.dup
-      history = messages.dup
-      init_len = messages.length
-
-      while history.length - init_len < max_turns && active_agent
-        agent_tracker.update(active_agent)
-        history = OpenAISwarm::Util.latest_role_user_message(history) if agent_tracker.switch_agent_reset_message?
-
-        message = OpenAISwarm::Util.message_template(agent.name)
-        completion = get_chat_completion(
-          agent_tracker,
-          history,
-          context_variables,
-          model_override,
-          true, # stream
-          debug,
-          metadata
-        )
-
-        yield({ delim: "start" }) if block_given?
-        completion.each do |stream|
-
-          # TODO(Grayson): will refactor it
-          if stream['parameters']
-            yield({ 'parameters' => stream['parameters'], 'agent' => active_agent&.name }) if block_given?
-          end
-          next if stream.key?('parameters')
-
-          chunk = stream[:chunk]
-          if chunk['error']
-            details = {
-              'response' =>
-                 Response.new(
-                   messages: messages,
-                   agent: active_agent,
-                   context_variables: context_variables)
-            }
-            raise OpenAISwarm::Error.new(chunk['error'], details)
-          end
-
-          delta = chunk.dig('choices', 0, 'delta')
-          if delta['role'] == "assistant"
-            delta['sender'] = active_agent.name
-          end
-
-          yield({ 'delta' => delta })  if block_given?
-
-          delta.delete('role')
-          delta.delete('sender')
-          Util.merge_chunk(message, delta)
-        end
-        yield({ delim: "end" }) if block_given?
-
-        message['tool_calls'] = message['tool_calls'].values
-        message['tool_calls'] = nil if message['tool_calls'].empty?
-        Util.debug_print(debug, "Received completion:", message)
-        log_message(:info, "Received completion:", message)
-
-        history << message
-
-
-        if !message['tool_calls'] || !execute_tools
-          log_message(:info, "Ending turn.")
-          break
-        end
-
-        # convert tool_calls to objects
-        tool_calls = message['tool_calls'].map do |tool_call|
-          OpenStruct.new(
-            id: tool_call['id'],
-            function: OpenStruct.new(
-              arguments: tool_call['function']['arguments'],
-              name: tool_call['function']['name']
-            ),
-            type: tool_call['type']
-          )
         end
 
         partial_response = handle_tool_calls(
@@ -336,7 +241,7 @@ module OpenAISwarm
         )
 
         if partial_response.agent
-          agent_tool_name = message['tool_calls'].dig(0, 'function', 'name')
+          agent_tool_name = tool_calls.any? && tool_calls[0]['name']
           agent_tracker.add_tracking_agents_tool_name(agent_tool_name)
         end
 
@@ -344,21 +249,130 @@ module OpenAISwarm
         context_variables.merge!(partial_response.context_variables)
         active_agent = partial_response.agent if partial_response.agent
 
-        tool_call_messages = (Array.wrap(message) + partial_response.messages)
-        yield(
-          'tool_call_messages' => Response.new(
-            messages: tool_call_messages,
-            agent: active_agent,
-            context_variables: context_variables)
-        ) if block_given?
+        Util.debug_print(debug, "history.length: #{history.length}, init_len: #{init_len}, max_turns: #{max_turns}, active_agent: #{active_agent && active_agent.name}")
       end
 
-      yield(
-        'response' => Response.new(messages: history[init_len..],
-                                   agent: active_agent,
-                                   context_variables: context_variables)
-      ) if block_given?
+      Response.new(
+        messages: history[init_len..],
+        agent: active_agent,
+        context_variables: context_variables
+      )
     end
+
+    # TODO(Grayson): a lot of copied code here that will be refactored
+    # TODO(Chris): Uncomment and refacftor for responses API when ready
+    # def run_and_stream(agent:, messages:, context_variables: {}, model_override: nil, debug: false, max_turns: Float::INFINITY, execute_tools: true, metadata: nil)
+    #   agent_tracker = OpenAISwarm::Agents::ChangeTracker.new(agent)
+    #   active_agent = agent
+    #   context_variables = context_variables.dup
+    #   history = messages.dup
+    #   init_len = messages.length
+
+    #   while history.length - init_len < max_turns && active_agent
+    #     agent_tracker.update(active_agent)
+    #     history = OpenAISwarm::Util.latest_role_user_message(history) if agent_tracker.switch_agent_reset_message?
+
+    #     message = OpenAISwarm::Util.message_template(agent.name)
+    #     completion = get_chat_completion(
+    #       agent_tracker,
+    #       history,
+    #       context_variables,
+    #       model_override,
+    #       true, # stream
+    #       debug,
+    #       metadata
+    #     )
+
+    #     yield({ delim: "start" }) if block_given?
+    #     completion.each do |stream|
+
+    #       # TODO(Grayson): will refactor it
+    #       if stream['parameters']
+    #         yield({ 'parameters' => stream['parameters'], 'agent' => active_agent&.name }) if block_given?
+    #       end
+    #       next if stream.key?('parameters')
+
+    #       chunk = stream[:chunk]
+    #       if chunk['error']
+    #         details = {
+    #           'response' =>
+    #              Response.new(
+    #                messages: messages,
+    #                agent: active_agent,
+    #                context_variables: context_variables)
+    #         }
+    #         raise OpenAISwarm::Error.new(chunk['error'], details)
+    #       end
+
+    #       delta = chunk.dig('choices', 0, 'delta')
+    #       if delta['role'] == "assistant"
+    #         delta['sender'] = active_agent.name
+    #       end
+
+    #       yield({ 'delta' => delta })  if block_given?
+
+    #       delta.delete('role')
+    #       delta.delete('sender')
+    #       Util.merge_chunk(message, delta)
+    #     end
+    #     yield({ delim: "end" }) if block_given?
+
+    #     message['tool_calls'] = message['tool_calls'].values
+    #     message['tool_calls'] = nil if message['tool_calls'].empty?
+    #     Util.debug_print(debug, "Received completion:", message)
+    #     log_message(:info, "Received completion:", message)
+
+    #     history << message
+
+
+    #     if !message['tool_calls'] || !execute_tools
+    #       log_message(:info, "Ending turn.")
+    #       break
+    #     end
+
+    #     # convert tool_calls to objects
+    #     tool_calls = message['tool_calls'].map do |tool_call|
+    #       OpenStruct.new(
+    #         id: tool_call['id'],
+    #         function: OpenStruct.new(
+    #           arguments: tool_call['function']['arguments'],
+    #           name: tool_call['function']['name']
+    #         ),
+    #         type: tool_call['type']
+    #       )
+    #     end
+
+    #     partial_response = handle_tool_calls(
+    #       tool_calls,
+    #       active_agent,
+    #       context_variables,
+    #       debug
+    #     )
+
+    #     if partial_response.agent
+    #       agent_tool_name = message['tool_calls'].dig(0, 'function', 'name')
+    #       agent_tracker.add_tracking_agents_tool_name(agent_tool_name)
+    #     end
+
+    #     history.concat(partial_response.messages)
+    #     context_variables.merge!(partial_response.context_variables)
+    #     active_agent = partial_response.agent if partial_response.agent
+
+    #     tool_call_messages = (Array.wrap(message) + partial_response.messages)
+    #     yield(
+    #       'tool_call_messages' => Response.new(
+    #         messages: tool_call_messages,
+    #         agent: active_agent,
+    #         context_variables: context_variables)
+    #     ) if block_given?
+    #   end
+
+    #   yield(
+    #     'response' => Response.new(messages: history[init_len..],
+    #                                agent: active_agent,
+    #                                context_variables: context_variables)
+    #   ) if block_given?
+    # end
 
     private
 
