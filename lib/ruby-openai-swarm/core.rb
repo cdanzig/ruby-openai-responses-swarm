@@ -29,6 +29,7 @@ module OpenAISwarm
     # end
 
     def get_chat_completion(agent_tracker, history, context_variables, model_override, stream, debug, metadata = nil)
+
       agent = agent_tracker.current_agent
       context_variables = context_variables.dup
       instructions = agent.instructions.respond_to?(:call) ? agent.instructions.call(context_variables) : agent.instructions
@@ -44,7 +45,7 @@ module OpenAISwarm
       # hide context_variables from model
 
       tools.each do |tool|
-        if tool[:parameters]
+        if tool[:parameters] # openai built-in tools don't have parameters
           params = tool[:parameters]
           params[:properties].delete(CTX_VARS_NAME.to_sym)
           params[:required]&.delete(CTX_VARS_NAME.to_sym)
@@ -75,9 +76,6 @@ module OpenAISwarm
       create_params[:tool_choice] = agent.tool_choice if agent.tool_choice
       create_params[:parallel_tool_calls] = agent.parallel_tool_calls if tools.any?
 
-      Util.debug_print(debug, "Getting chat completion for...:", create_params)
-      log_message(:info, "Getting chat completion for...:", create_params)
-
       # if stream
       #   return Enumerator.new do |yielder|
       #     yielder << { 'parameters' => create_params }
@@ -90,7 +88,9 @@ module OpenAISwarm
       # else
         # Need to remove the sender for the responses API
         create_params[:input] = create_params[:input].map{|m| m.reject{|k,v| k == "sender"}}
-        Rails.logger.info("Calling response.create with parameters: #{create_params.inspect}")
+        Util.debug_print(debug, "Getting chat completion for...:", create_params)
+        log_message(:info, "Getting chat completion for...:", create_params)
+
         response = @client.responses.create(parameters: create_params)
       # end
 
@@ -109,7 +109,7 @@ module OpenAISwarm
         result
       when Agent
         Result.new(
-          value: "success", #JSON.generate({ assistant: result.name }),
+          value: "successfully transfered", #JSON.generate({ assistant: result.name }),
           agent: result
         )
       else
@@ -168,6 +168,7 @@ module OpenAISwarm
         raw_result = is_parameters ? func.call(**arguments) : func.call
         result = handle_function_result(raw_result, debug)
 
+
         partial_response.messages << {
           'type' => 'function_call_output',
           'call_id' => tool_call['call_id'],
@@ -206,9 +207,44 @@ module OpenAISwarm
         agent_tracker.update(active_agent)
         history = OpenAISwarm::Util.latest_role_user_message(history) if agent_tracker.switch_agent_reset_message?
 
+        # get rid of unwanted transfer messages
+        rejected_call_ids = []
+        history.each_with_index do |message, index|
+          next if message.nil?
+
+          if message["type"] == 'function_call' and message["name"].match?(/^transfer_to_/)
+            rejected_call_ids << message["call_id"]
+
+            # remove the function call message
+            Util.debug_print(debug, "Skipping #{message["name"]} function_call (call_id #{message["call_id"]}) \n #{history[index].inspect}")
+            history[index] = nil 
+            
+            # remove the associated reasoning message if there is one
+            if history[index-1] && history[index-1]["type"] == 'reasoning'
+              Util.debug_print(debug, "Skipping associated reasoning message \n #{history[index-1].inspect}")
+              history[index-1] = nil 
+            end
+          end
+        end
+        # history.compact!
+
+        # get rid of associated function_call_output messages
+        if rejected_call_ids.any?
+          history.each_with_index do |message, index|
+            next if message.nil?
+            if message["type"] == 'function_call_output' and rejected_call_ids.include?(message["call_id"])
+              Util.debug_print(debug, "Skipping #{message["type"]} for call_id #{message["call_id"]} \n #{message.inspect}")
+              history[index] = nil
+            end
+          end
+          # history.compact!
+        end
+
+        Util.debug_print(debug, "History: #{history.collect{|m| m.nil? ? nil : {type: m["type"], role: m["role"], id: m["id"]}}}")
+
         completion = get_chat_completion(
           agent_tracker,
-          history,
+          history.compact,
           context_variables,
           model_override,
           stream,
@@ -217,13 +253,15 @@ module OpenAISwarm
         )
 
         # add to the messages array
-        Util.debug_print(debug, "Whole Completion: #{completion.inspect}")
-        messages = []
+        # Util.debug_print(debug, "Whole Completion: #{completion.inspect}")
+        
         completion['output'].each do |output|
           output['sender'] = active_agent&.name
+          history << output
           Util.debug_print(debug, "Found a #{output['type']} output: #{output.inspect}")
         end
-        history += completion['output']
+
+        Util.debug_print(debug, "History after completion: #{history.collect{|m| m.nil? ? nil : {type: m["type"], role: m["role"], id: m["id"]}}}")
 
         tool_calls = completion['output'].select { |output| output['type'] == 'function_call' }
 
@@ -246,14 +284,20 @@ module OpenAISwarm
         end
 
         history.concat(partial_response.messages)
+
+        Util.debug_print(debug, "History with function responses: #{history.collect{|m| m.nil? ? nil : {type: m["type"], role: m["role"], id: m["id"]}}}")
+
+        if partial_response.agent
+          Util.debug_print(debug, "Next agent: #{partial_response.agent.name}");
+        end
+
         context_variables.merge!(partial_response.context_variables)
         active_agent = partial_response.agent if partial_response.agent
-
-        Util.debug_print(debug, "history.length: #{history.length}, init_len: #{init_len}, max_turns: #{max_turns}, active_agent: #{active_agent && active_agent.name}")
       end
-
+      
       Response.new(
-        messages: history[init_len..],
+        # messing with the histroy length causes issues!
+        messages: history[init_len..].compact,
         agent: active_agent,
         context_variables: context_variables
       )

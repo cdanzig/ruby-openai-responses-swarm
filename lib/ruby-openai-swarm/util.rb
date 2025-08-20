@@ -13,7 +13,7 @@ module OpenAISwarm
         return tools if tool_names.empty? || !prevent_agent_reentry
 
         symbolize_keys_to_string(tools).reject do |tool|
-          tool_names.include?("#{tool['function']['name']}")
+          tool_names.include?("#{tool['name']}")
         end
       end
     end
@@ -22,7 +22,7 @@ module OpenAISwarm
       return unless debug
       timestamp = Time.now.strftime("%Y-%m-%d %H:%M:%S")
       message = args.map(&:to_s).join(' ')
-      puts "\e[97m[\e[90m#{timestamp}\e[97m]\e[90m #{message}\e[0m"
+      puts "\e[97m[\e[90m#{timestamp}\e[97m]\e[90m \n\n#{message}\n \e[0m"
     end
 
     def self.symbolize_keys_to_string(obj)
@@ -39,34 +39,29 @@ module OpenAISwarm
     def self.clean_message_tools(messages, tool_names)
       return messages if tool_names.empty?
       filtered_messages = symbolize_keys_to_string(messages.dup)
-      # Collect tool call IDs to be removed
-      tool_call_ids_to_remove = filtered_messages
-        .select { |msg| msg['tool_calls'] }
-        .flat_map { |msg| msg['tool_calls'] }
-        .select { |tool_call| tool_names.include?(tool_call['function']['name']) }
-        .map { |tool_call| tool_call['id'] }
+      call_ids_to_remove = filtered_messages.select { |msg| msg['type'] == 'function_call' and tool_names.include?(msg['name']) }.map { |msg| msg['call_id'] }
 
       # Remove specific messages
-      filtered_messages.reject! do |msg|
-        # Remove tool call messages for specified tool names
-        (msg['role'] == 'assistant' &&
-         msg['tool_calls']&.all? { |tool_call| tool_names.include?(tool_call['function']['name']) }) ||
-        # Remove tool response messages for specified tool calls
-        (msg['role'] == 'tool' && tool_call_ids_to_remove.include?(msg['tool_call_id']))
-      end
+      filtered_messages.each_with_index do |msg, index|
+        # Remove function_call messages for specified function names
+        if msg['type'] == 'function_call' && tool_names.include?(msg['name'])
+          Util.debug_print(true, "Cleaning #{msg['name']} function_call (call_id #{msg['call_id']}) \n #{msg.inspect}")
+          filtered_messages[index] = nil
 
-      # If assistant message's tool_calls becomes empty, modify that message
-      filtered_messages.map! do |msg|
-        if msg['role'] == 'assistant' && msg['tool_calls']
-          msg['tool_calls'].reject! { |tool_call| tool_names.include?(tool_call['function']['name']) }
-          msg['tool_calls'] = nil if msg['tool_calls'].empty?
-          msg
-        else
-          msg
+          if filtered_messages[index-1] && filtered_messages[index-1]["type"] == 'reasoning'
+            Util.debug_print(true, "Cleaning associated reasoning message \n #{filtered_messages[index-1].inspect}")
+            filtered_messages[index-1] = nil # remove the reasoning message
+          end
+        end
+
+        # Remove function_call_output responses for associated function_call messages
+        if msg['type'] == 'function_call_output' && call_ids_to_remove.include?(msg['call_id'])
+          Util.debug_print(true, "Cleaning #{msg['type']} for call_id #{msg['call_id']} \n #{msg.inspect}")
+          filtered_messages[index] = nil
         end
       end
 
-      filtered_messages
+      # filtered_messages.compact
     end
 
     def self.message_template(agent_name)
